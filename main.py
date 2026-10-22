@@ -21,29 +21,36 @@ AMAZON_HEADERS = {
     "DNT": "1",
 }
 
-FLIPKART_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+SEARCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "en-IN,en;q=0.9",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Dest": "document",
 }
 
 @app.get("/")
 def home():
     return {"status": "ok", "service": "Youron API Running"}
 
+def clean_title_for_search(q: str) -> str:
+    # Amazon Brand ya Flipkart SmartBuy prefix hatayein
+    q = re.sub(r'(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)', '', q)
+    # Delimiters par cut karein
+    q = re.split(r'[|\[(]', q)[0].strip()
+    q = re.sub(r'[!?,]', '', q)
+    q = re.sub(r'(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b', '', q)
+    return re.sub(r'\s+', ' ', q).strip()
+
 @app.get("/compare")
 async def compare_prices(query: str = Query(..., min_length=2)):
-    clean_q = urllib.parse.quote_plus(query)
+    clean_q = clean_title_for_search(query)
+    clean_encoded = urllib.parse.quote_plus(clean_q)
 
-    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-        amazon_data = await scrape_amazon(client, clean_q)
-        flipkart_data = await scrape_flipkart(client, query, clean_q)
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+        amazon_data = await scrape_amazon(client, clean_encoded)
+        flipkart_data = await scrape_flipkart(client, clean_q, clean_encoded)
 
     return {
         "query": query,
+        "clean_query": clean_q,
         "amazon": amazon_data,
         "flipkart": flipkart_data
     }
@@ -80,67 +87,84 @@ async def scrape_amazon(client: httpx.AsyncClient, query_encoded: str):
         pass
     return {"available": False, "price": "", "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"}
 
-async def scrape_flipkart(client: httpx.AsyncClient, raw_query: str, query_encoded: str):
-    # Method 1: Mobile Web Search
-    url = f"https://www.flipkart.com/search?q={query_encoded}"
+async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
+    # Method 1: Bing Search Engine Index (Never Blocks Datacenters)
     try:
-        resp = await client.get(url, headers=FLIPKART_HEADERS)
+        bing_url = f"https://www.bing.com/search?q=site:flipkart.com/p/+{query_encoded}"
+        resp = await client.get(bing_url, headers=SEARCH_HEADERS)
         if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
+            text = resp.text
+            matches = re.findall(r'href="(https://www\.flipkart\.com/[^"]+/p/[^"]+)"', text)
+            if matches:
+                clean_url = matches[0].split("&")[0].split("?")[0]
+                full_pdp = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
 
-            cards = soup.select("a[href*='/p/']")
-            for card in cards:
-                href = card.get("href", "")
-                if "/p/" not in href:
-                    continue
+                p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', text)
+                price = f"₹{p_match.group(1).replace(',', '')}" if p_match else ""
 
-                price_elem = card.select_one("div.Nx9bqj, div._30jeq3, div._16Jk6d")
-                if not price_elem:
-                    parent = card.parent
-                    if parent:
-                        price_elem = parent.select_one("div.Nx9bqj, div._30jeq3")
+                return {
+                    "available": True,
+                    "title": clean_q,
+                    "price": price if price else "Best Deal",
+                    "pdp_url": full_pdp
+                }
+    except Exception:
+        pass
 
-                title_elem = card.select_one("div.KzDlHZ, div._4rR01T, span.B_NuCI, div.wByoh7")
+    # Method 2: DuckDuckGo HTML Search Index
+    try:
+        ddg_url = f"https://html.duckduckgo.com/html/?q=site:flipkart.com/p/+{query_encoded}"
+        resp = await client.get(ddg_url, headers=SEARCH_HEADERS)
+        if resp.status_code == 200:
+            text = resp.text
+            matches = re.findall(r'uddg=(https[^&"]+)', text)
+            for m in matches:
+                decoded_url = urllib.parse.unquote(m)
+                if "flipkart.com" in decoded_url and ("/p/" in decoded_url or "itm" in decoded_url):
+                    clean_url = decoded_url.split("&")[0].split("?")[0]
+                    full_pdp = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
 
-                if price_elem:
-                    price_text = price_elem.text.strip()
-                    clean_path = href.split("?")[0]
-                    full_pdp = f"https://dl.flipkart.com/dl{clean_path}" if clean_path.startswith("/") else f"https://dl.flipkart.com/dl/{clean_path}"
+                    p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', text)
+                    price = f"₹{p_match.group(1).replace(',', '')}" if p_match else ""
 
                     return {
                         "available": True,
-                        "title": title_elem.text.strip() if title_elem else raw_query,
-                        "price": price_text,
+                        "title": clean_q,
+                        "price": price if price else "Best Deal",
                         "pdp_url": full_pdp
                     }
     except Exception:
         pass
 
-    # Method 2: Public Auto-Suggest Endpoint
+    # Method 3: Yahoo Search Index
     try:
-        suggest_url = f"https://1.rome.api.flipkart.com/api/4/discover/autosuggest?prefix={query_encoded}&vertical=all"
-        resp = await client.get(suggest_url, headers=FLIPKART_HEADERS)
+        yahoo_url = f"https://search.yahoo.com/search?p=site:flipkart.com/p/+{query_encoded}"
+        resp = await client.get(yahoo_url, headers=SEARCH_HEADERS)
         if resp.status_code == 200:
-            data = resp.json()
-            suggestions = data.get("RESPONSE", {}).get("suggestions", [])
-            for s in suggestions:
-                url_path = s.get("url", "")
-                if "/p/" in url_path:
-                    clean_path = url_path.split("?")[0]
-                    full_pdp = f"https://dl.flipkart.com/dl{clean_path}" if clean_path.startswith("/") else f"https://dl.flipkart.com/dl/{clean_path}"
+            text = resp.text
+            matches = re.findall(r'RU=([^/&"]+)', text)
+            for m in matches:
+                decoded_url = urllib.parse.unquote(m)
+                if "flipkart.com" in decoded_url and ("/p/" in decoded_url or "itm" in decoded_url):
+                    clean_url = decoded_url.split("&")[0].split("?")[0]
+                    full_pdp = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
+
+                    p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', text)
+                    price = f"₹{p_match.group(1).replace(',', '')}" if p_match else ""
+
                     return {
                         "available": True,
-                        "title": s.get("title", raw_query),
-                        "price": "Check on Flipkart",
+                        "title": clean_q,
+                        "price": price if price else "Best Deal",
                         "pdp_url": full_pdp
                     }
     except Exception:
         pass
 
-    # Fallback to direct app search intent
+    # Direct Deep-Link Search Fallback
     return {
         "available": True,
-        "title": raw_query,
+        "title": clean_q,
         "price": "Check on Flipkart",
         "pdp_url": f"https://dl.flipkart.com/dl/search?q={query_encoded}"
     }
