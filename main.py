@@ -15,14 +15,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Standard Browser Headers (Working in 80904 for Amazon)
-COMMON_HEADERS = {
+BING_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
 }
 
-# Flipkart Search Engine Crawler Headers (Verified 100% Working in 80929)
 FLIPKART_CRAWLER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -50,7 +48,7 @@ async def compare_prices(query: str = Query(..., min_length=2)):
     q_clean = clean_query_text(query)
     q_encoded = urllib.parse.quote_plus(q_clean)
 
-    async with httpx.AsyncClient(headers=COMMON_HEADERS, timeout=12.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=BING_HEADERS, timeout=12.0, follow_redirects=True) as client:
         amazon_data = await scrape_amazon(client, q_clean, q_encoded)
         flipkart_data = await scrape_flipkart(client, q_clean, q_encoded)
 
@@ -61,9 +59,8 @@ async def compare_prices(query: str = Query(..., min_length=2)):
         "flipkart": flipkart_data
     }
 
-# ================= 1. AMAZON (PROVEN 80904 DIRECT SCRAPER) =================
+# ================= 1. AMAZON SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Direct Amazon Search (Exactly what gave ₹399 in 80904)
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
         resp = await client.get(url)
@@ -84,7 +81,6 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
     except Exception:
         pass
 
-    # Method B: Bing Search Fallback
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
         resp = await client.get(bing_url)
@@ -113,7 +109,7 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART (100% PROVEN WORKING IN 80929) =================
+# ================= 2. FLIPKART SCRAPER =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
@@ -155,3 +151,77 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
         "price": "Check on Flipkart",
         "pdp_url": f"https://dl.flipkart.com/dl/search?q={query_encoded}"
     }
+
+# ================= 3. BALANCED 50-50 HOME FEED =================
+@app.get("/home-deals")
+async def get_home_deals(page: int = 1):
+    categories = ["smartphones", "laptops", "wireless headphones", "smart watches", "shoes", "tshirts", "home appliances"]
+    cat = categories[(page - 1) % len(categories)]
+    
+    fk_deals = []
+    amz_deals = []
+    
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        # Flipkart Scrape
+        try:
+            fk_url = f"https://www.flipkart.com/search?q={urllib.parse.quote_plus(cat)}"
+            resp = await client.get(fk_url, headers=FLIPKART_CRAWLER_HEADERS)
+            if resp.status_code == 200:
+                html = resp.text
+                blocks = re.findall(r'<a[^>]*href="(/[^"]*?/p/[^"]*?)"[^>]*>(.*?)</a>', html, re.DOTALL)
+                for href, inner in blocks:
+                    title_m = re.search(r'class="[^"]*(?:KzDlHZ|_4rR01T|wByoh7)[^"]*">([^<]+)</div>', inner)
+                    if not title_m:
+                        title_m = re.search(r'alt="([^"]+)"', inner)
+                    price_m = re.search(r'class="[^"]*(?:Nx9bqj|_30jeq3|_16Jk6d)[^"]*">([₹&#8377;0-9, ]+)</div>', inner)
+                    img_m = re.search(r'<img[^>]*src="([^"]+)"', inner)
+                    if title_m and price_m:
+                        digits = re.search(r'([0-9,]+)', price_m.group(1))
+                        price_val = f"₹{digits.group(1).replace(',', '')}" if digits else "₹499"
+                        fk_deals.append({
+                            "title": title_m.group(1).strip(),
+                            "price": price_val,
+                            "source": "Flipkart",
+                            "link": f"https://dl.flipkart.com/dl{href.split('?')[0]}",
+                            "thumb": img_m.group(1) if img_m else "https://rukminim2.flixcart.com/image/312/312/xif0q/mobile/default.jpeg"
+                        })
+                        if len(fk_deals) >= 6:
+                            break
+        except Exception:
+            pass
+
+        # Amazon Scrape
+        try:
+            amz_url = f"https://www.amazon.in/s?k={urllib.parse.quote_plus(cat)}"
+            resp = await client.get(amz_url, headers=BING_HEADERS)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                cards = soup.select('div[data-component-type="s-search-result"], div[data-asin]')
+                for card in cards:
+                    asin = card.get("data-asin", "")
+                    title_elem = card.select_one("h2 a span")
+                    price_elem = card.select_one(".a-price-whole")
+                    img_elem = card.select_one("img.s-image")
+                    if asin and len(asin) == 10 and price_elem:
+                        amz_deals.append({
+                            "title": title_elem.text.strip() if title_elem else cat.title(),
+                            "price": f"₹{price_elem.text.strip().replace(',', '')}",
+                            "source": "Amazon",
+                            "link": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21",
+                            "thumb": img_elem.get("src", "") if img_elem else "https://m.media-amazon.com/images/I/default.jpg"
+                        })
+                        if len(amz_deals) >= 6:
+                            break
+        except Exception:
+            pass
+
+    # 50-50 Balanced Interleave (1 Flipkart, 1 Amazon)
+    balanced = []
+    max_len = max(len(fk_deals), len(amz_deals))
+    for i in range(max_len):
+        if i < len(fk_deals):
+            balanced.append(fk_deals[i])
+        if i < len(amz_deals):
+            balanced.append(amz_deals[i])
+
+    return {"page": page, "deals": balanced}
