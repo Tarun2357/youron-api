@@ -17,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-Memory Cache (1 Hour Expiry) for Instant Loading
 PRICE_CACHE = {}
 
 DESKTOP_HEADERS = {
@@ -37,15 +36,20 @@ def home():
     return {"status": "ok", "service": "Youron Ultra-Fast Price Engine"}
 
 def clean_query_text(q: str) -> str:
+    # 1. Remove markdown links / brackets
     q = re.sub(r"\]\s*\(https?://[^\)]+\)", "", q)
     q = re.sub(r"https?://\S+", "", q)
+    # 2. Remove specifications that break search (RAM, GB, Colors, Delimiters)
+    q = re.sub(r"\(.*?\)", "", q)
+    q = re.sub(r"\[.*?\]", "", q)
+    q = re.sub(r"(?i)\b\d+\s*(?:gb|ram|rom|tb|storage|inch|cm|display)\b", "", q)
+    q = re.sub(r"(?i)\b(black|blue|white|green|grey|red|silver|gold)\b", "", q)
+    q = re.sub(r"[-–|,].*", "", q)
     q = re.sub(r"(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)", "", q)
-    q = q.split("|")[0].split("(")[0].split("[")[0].split("]")[0].strip()
     q = re.sub(r"[!?,]", "", q)
-    q = re.sub(r"(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b", "", q)
     words = q.split()
-    if len(words) > 5:
-        q = " ".join(words[:5])
+    if len(words) > 4:
+        q = " ".join(words[:4])
     return re.sub(r"\s+", " ", q).strip()
 
 @app.get("/compare")
@@ -53,7 +57,6 @@ async def compare_prices(query: str = Query(..., min_length=2)):
     q_clean = clean_query_text(query)
     cache_key = q_clean.lower()
     
-    # 1. Return from instant cache if exists and not expired (< 3600 sec)
     if cache_key in PRICE_CACHE:
         cached_data, timestamp = PRICE_CACHE[cache_key]
         if time.time() - timestamp < 3600:
@@ -61,11 +64,11 @@ async def compare_prices(query: str = Query(..., min_length=2)):
 
     q_encoded = urllib.parse.quote_plus(q_clean)
 
-    # 2. Parallel Scraping with Asyncio (Cuts time from 16s down to 3-4s)
+    # Parallel Fetching (Under 3 seconds)
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        amazon_task = scrape_amazon(client, q_clean, q_encoded)
-        flipkart_task = scrape_flipkart(client, q_clean, q_encoded)
-        amazon_data, flipkart_data = await asyncio.gather(amazon_task, flipkart_task)
+        amz_task = scrape_amazon(client, q_clean, q_encoded)
+        fk_task = scrape_flipkart(client, q_clean, q_encoded)
+        amazon_data, flipkart_data = await asyncio.gather(amz_task, fk_task)
 
     response_payload = {
         "query": query,
@@ -77,9 +80,9 @@ async def compare_prices(query: str = Query(..., min_length=2)):
     PRICE_CACHE[cache_key] = (response_payload, time.time())
     return response_payload
 
-# ================= 1. AMAZON PARALLEL SCRAPER =================
+# ================= 1. AMAZON SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Direct Amazon
+    # Method A: Direct Amazon Scraping
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
         resp = await client.get(url, headers=DESKTOP_HEADERS)
@@ -100,7 +103,7 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
     except Exception:
         pass
 
-    # Method B: Fast Bing Index
+    # Method B: Bing Fallback
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
         resp = await client.get(bing_url, headers=DESKTOP_HEADERS)
@@ -127,7 +130,7 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART STRICT PRICE SCRAPER (NO MORE ₹10000 BUG) =================
+# ================= 2. FLIPKART SCRAPER =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
@@ -135,7 +138,6 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             
-            # Find exact product link
             pdp_link = None
             for a in soup.find_all("a", href=True):
                 href = a["href"]
@@ -144,7 +146,6 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
                     pdp_link = f"https://www.flipkart.com{clean_path}" if clean_path.startswith("/") else clean_path
                     break
 
-            # Find exact selling price element (NOT discount banner)
             price_str = None
             price_tag = soup.select_one("div.Nx9bqj, div._30jeq3, div._16Jk6d")
             if price_tag:
@@ -169,17 +170,16 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
         "pdp_url": f"https://www.flipkart.com/search?q={query_encoded}"
     }
 
-# ================= 3. BALANCED 50-50 HOME FEED =================
+# ================= 3. BALANCED HOME DEALS FEED =================
 @app.get("/home-deals")
 async def get_home_deals(page: int = 1):
-    categories = ["smartphones", "laptops", "wireless headphones", "smart watches", "shoes", "tshirts", "home appliances"]
+    categories = ["smartphones", "laptops", "headphones", "smart watches", "shoes"]
     cat = categories[(page - 1) % len(categories)]
     
     fk_deals = []
     amz_deals = []
     
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        # Flipkart Scrape
+    async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
         try:
             fk_url = f"https://www.flipkart.com/search?q={urllib.parse.quote_plus(cat)}"
             resp = await client.get(fk_url, headers=FLIPKART_CRAWLER_HEADERS)
@@ -193,19 +193,21 @@ async def get_home_deals(page: int = 1):
                         img_el = a.select_one("img")
                         if title_el and price_el:
                             digits = re.search(r'([0-9,]+)', price_el.text)
+                            img_src = img_el.get("src", "") if img_el else ""
+                            if not img_src or "data:image" in img_src:
+                                img_src = "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=400&q=80"
                             fk_deals.append({
                                 "title": title_el.text.strip(),
                                 "price": f"₹{digits.group(1).replace(',', '')}" if digits else "₹499",
                                 "source": "Flipkart",
                                 "link": f"https://www.flipkart.com{href.split('?')[0]}",
-                                "thumb": img_el.get("src", "") if img_el else "https://rukminim2.flixcart.com/image/312/312/xif0q/mobile/default.jpeg"
+                                "thumb": img_src
                             })
                             if len(fk_deals) >= 6:
                                 break
         except Exception:
             pass
 
-        # Amazon Scrape
         try:
             amz_url = f"https://www.amazon.in/s?k={urllib.parse.quote_plus(cat)}"
             resp = await client.get(amz_url, headers=DESKTOP_HEADERS)
@@ -218,12 +220,13 @@ async def get_home_deals(page: int = 1):
                     price_elem = card.select_one(".a-price-whole")
                     img_elem = card.select_one("img.s-image")
                     if asin and len(asin) == 10 and price_elem:
+                        img_src = img_elem.get("src", "") if img_elem else "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=400&q=80"
                         amz_deals.append({
                             "title": title_elem.text.strip() if title_elem else cat.title(),
                             "price": f"₹{price_elem.text.strip().replace(',', '')}",
                             "source": "Amazon",
                             "link": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21",
-                            "thumb": img_elem.get("src", "") if img_elem else "https://m.media-amazon.com/images/I/default.jpg"
+                            "thumb": img_src
                         })
                         if len(amz_deals) >= 6:
                             break
