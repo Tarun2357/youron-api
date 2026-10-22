@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import re
+import time
 import urllib.parse
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +17,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BING_HEADERS = {
+# In-Memory Cache (1 Hour Expiry) for Instant Loading
+PRICE_CACHE = {}
+
+DESKTOP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
@@ -29,7 +34,7 @@ FLIPKART_CRAWLER_HEADERS = {
 
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "Youron API Running"}
+    return {"status": "ok", "service": "Youron Ultra-Fast Price Engine"}
 
 def clean_query_text(q: str) -> str:
     q = re.sub(r"\]\s*\(https?://[^\)]+\)", "", q)
@@ -46,53 +51,66 @@ def clean_query_text(q: str) -> str:
 @app.get("/compare")
 async def compare_prices(query: str = Query(..., min_length=2)):
     q_clean = clean_query_text(query)
+    cache_key = q_clean.lower()
+    
+    # 1. Return from instant cache if exists and not expired (< 3600 sec)
+    if cache_key in PRICE_CACHE:
+        cached_data, timestamp = PRICE_CACHE[cache_key]
+        if time.time() - timestamp < 3600:
+            return cached_data
+
     q_encoded = urllib.parse.quote_plus(q_clean)
 
-    async with httpx.AsyncClient(headers=BING_HEADERS, timeout=12.0, follow_redirects=True) as client:
-        amazon_data = await scrape_amazon(client, q_clean, q_encoded)
-        flipkart_data = await scrape_flipkart(client, q_clean, q_encoded)
+    # 2. Parallel Scraping with Asyncio (Cuts time from 16s down to 3-4s)
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        amazon_task = scrape_amazon(client, q_clean, q_encoded)
+        flipkart_task = scrape_flipkart(client, q_clean, q_encoded)
+        amazon_data, flipkart_data = await asyncio.gather(amazon_task, flipkart_task)
 
-    return {
+    response_payload = {
         "query": query,
         "clean_query": q_clean,
         "amazon": amazon_data,
         "flipkart": flipkart_data
     }
 
-# ================= 1. AMAZON SCRAPER =================
+    PRICE_CACHE[cache_key] = (response_payload, time.time())
+    return response_payload
+
+# ================= 1. AMAZON PARALLEL SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
+    # Method A: Direct Amazon
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
-        resp = await client.get(url)
+        resp = await client.get(url, headers=DESKTOP_HEADERS)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            items = soup.select('div[data-component-type="s-search-result"], div[data-asin]')
-            for item in items:
-                asin = item.get("data-asin", "")
-                price_elem = item.select_one(".a-price-whole")
+            cards = soup.select('div[data-component-type="s-search-result"], div[data-asin]')
+            for card in cards:
+                asin = card.get("data-asin", "")
+                price_elem = card.select_one(".a-price-whole")
                 if asin and len(asin) == 10 and price_elem:
-                    clean_price = price_elem.text.strip().replace(",", "").rstrip(".")
+                    p = price_elem.text.strip().replace(",", "").rstrip(".")
                     return {
                         "available": True,
                         "title": clean_q,
-                        "price": f"₹{clean_price}",
+                        "price": f"₹{p}",
                         "pdp_url": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
                     }
     except Exception:
         pass
 
+    # Method B: Fast Bing Index
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
-        resp = await client.get(bing_url)
+        resp = await client.get(bing_url, headers=DESKTOP_HEADERS)
         if resp.status_code == 200:
             html = resp.text
-            asins = re.findall(r"/dp/([A-Z0-9]{10})", html)
-            if not asins:
-                asins = re.findall(r"\b(B0[A-Z0-9]{8})\b", html)
+            asins = re.findall(r"\b(B0[A-Z0-9]{8})\b", html)
             if asins:
                 asin = asins[0]
-                price_match = re.search(r"(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)", html)
-                price_str = f"₹{price_match.group(1).replace(',', '').rstrip('.')}" if price_match else "Best Price"
+                p_match = re.search(r'(?:₹|Rs\.?|&#8377;)\s*([0-9,]+)', html)
+                price_str = f"₹{p_match.group(1).replace(',', '').rstrip('.')}" if p_match else "Best Price"
                 return {
                     "available": True,
                     "title": clean_q,
@@ -109,38 +127,37 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART SCRAPER =================
+# ================= 2. FLIPKART STRICT PRICE SCRAPER (NO MORE ₹10000 BUG) =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
         resp = await client.get(fk_url, headers=FLIPKART_CRAWLER_HEADERS)
         if resp.status_code == 200:
-            html = resp.text
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            # Find exact product link
+            pdp_link = None
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "/p/itm" in href or ("/p/" in href and "pid=" in href):
+                    clean_path = href.split("?")[0]
+                    pdp_link = f"https://www.flipkart.com{clean_path}" if clean_path.startswith("/") else clean_path
+                    break
 
-            pdp_matches = re.findall(r'href="(/[^"]*?/p/[^"]*?)"', html)
-            if not pdp_matches:
-                pdp_matches = re.findall(r'href="([^"]*?flipkart\.com/[^"]*?/p/[^"]*?)"', html)
+            # Find exact selling price element (NOT discount banner)
+            price_str = None
+            price_tag = soup.select_one("div.Nx9bqj, div._30jeq3, div._16Jk6d")
+            if price_tag:
+                clean_digits = re.search(r'([0-9,]+)', price_tag.text)
+                if clean_digits:
+                    price_str = f"₹{clean_digits.group(1).replace(',', '')}"
 
-            price_matches = re.findall(r'class="[^"]*(?:Nx9bqj|_30jeq3|_16Jk6d)[^"]*">([₹&#8377;0-9, ]+)</div>', html)
-            if not price_matches:
-                price_matches = re.findall(r'(?:₹|&#8377;)\s*([0-9,]+)', html)
-
-            title_matches = re.findall(r'class="[^"]*(?:KzDlHZ|_4rR01T|wByoh7)[^"]*">([^<]+)</div>', html)
-
-            if pdp_matches:
-                raw_url = pdp_matches[0].split("?")[0]
-                pdp_url = f"https://dl.flipkart.com/dl{raw_url}" if raw_url.startswith("/") else raw_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
-
-                raw_price = price_matches[0] if price_matches else ""
-                clean_digits = re.search(r'([0-9,]+)', raw_price)
-                price_str = f"₹{clean_digits.group(1).replace(',', '').rstrip('.')}" if clean_digits else "Best Price"
-                title_str = title_matches[0].strip() if title_matches else clean_q
-
+            if pdp_link:
                 return {
                     "available": True,
-                    "title": title_str,
-                    "price": price_str,
-                    "pdp_url": pdp_url
+                    "title": clean_q,
+                    "price": price_str if price_str else "Best Price",
+                    "pdp_url": pdp_link
                 }
     except Exception:
         pass
@@ -149,7 +166,7 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
         "available": True,
         "title": clean_q,
         "price": "Check on Flipkart",
-        "pdp_url": f"https://dl.flipkart.com/dl/search?q={query_encoded}"
+        "pdp_url": f"https://www.flipkart.com/search?q={query_encoded}"
     }
 
 # ================= 3. BALANCED 50-50 HOME FEED =================
@@ -161,39 +178,37 @@ async def get_home_deals(page: int = 1):
     fk_deals = []
     amz_deals = []
     
-    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         # Flipkart Scrape
         try:
             fk_url = f"https://www.flipkart.com/search?q={urllib.parse.quote_plus(cat)}"
             resp = await client.get(fk_url, headers=FLIPKART_CRAWLER_HEADERS)
             if resp.status_code == 200:
-                html = resp.text
-                blocks = re.findall(r'<a[^>]*href="(/[^"]*?/p/[^"]*?)"[^>]*>(.*?)</a>', html, re.DOTALL)
-                for href, inner in blocks:
-                    title_m = re.search(r'class="[^"]*(?:KzDlHZ|_4rR01T|wByoh7)[^"]*">([^<]+)</div>', inner)
-                    if not title_m:
-                        title_m = re.search(r'alt="([^"]+)"', inner)
-                    price_m = re.search(r'class="[^"]*(?:Nx9bqj|_30jeq3|_16Jk6d)[^"]*">([₹&#8377;0-9, ]+)</div>', inner)
-                    img_m = re.search(r'<img[^>]*src="([^"]+)"', inner)
-                    if title_m and price_m:
-                        digits = re.search(r'([0-9,]+)', price_m.group(1))
-                        price_val = f"₹{digits.group(1).replace(',', '')}" if digits else "₹499"
-                        fk_deals.append({
-                            "title": title_m.group(1).strip(),
-                            "price": price_val,
-                            "source": "Flipkart",
-                            "link": f"https://dl.flipkart.com/dl{href.split('?')[0]}",
-                            "thumb": img_m.group(1) if img_m else "https://rukminim2.flixcart.com/image/312/312/xif0q/mobile/default.jpeg"
-                        })
-                        if len(fk_deals) >= 6:
-                            break
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if "/p/itm" in href:
+                        title_el = a.select_one(".KzDlHZ, ._4rR01T, .wByoh7")
+                        price_el = a.select_one(".Nx9bqj, ._30jeq3")
+                        img_el = a.select_one("img")
+                        if title_el and price_el:
+                            digits = re.search(r'([0-9,]+)', price_el.text)
+                            fk_deals.append({
+                                "title": title_el.text.strip(),
+                                "price": f"₹{digits.group(1).replace(',', '')}" if digits else "₹499",
+                                "source": "Flipkart",
+                                "link": f"https://www.flipkart.com{href.split('?')[0]}",
+                                "thumb": img_el.get("src", "") if img_el else "https://rukminim2.flixcart.com/image/312/312/xif0q/mobile/default.jpeg"
+                            })
+                            if len(fk_deals) >= 6:
+                                break
         except Exception:
             pass
 
         # Amazon Scrape
         try:
             amz_url = f"https://www.amazon.in/s?k={urllib.parse.quote_plus(cat)}"
-            resp = await client.get(amz_url, headers=BING_HEADERS)
+            resp = await client.get(amz_url, headers=DESKTOP_HEADERS)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 cards = soup.select('div[data-component-type="s-search-result"], div[data-asin]')
@@ -215,7 +230,6 @@ async def get_home_deals(page: int = 1):
         except Exception:
             pass
 
-    # 50-50 Balanced Interleave (1 Flipkart, 1 Amazon)
     balanced = []
     max_len = max(len(fk_deals), len(amz_deals))
     for i in range(max_len):
