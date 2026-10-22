@@ -4,7 +4,6 @@ import urllib.parse
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from bs4 import BeautifulSoup
 
 app = FastAPI(title="Youron Price Engine")
 
@@ -14,13 +13,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-AMAZON_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "DNT": "1",
-}
 
 FLIPKART_CRAWLER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -66,50 +58,46 @@ async def compare_prices(query: str = Query(..., min_length=2)):
         "flipkart": flipkart_data
     }
 
-# ================= 1. AMAZON SCRAPER =================
+# ================= 1. AMAZON SCRAPER (WITH BASE64 DECODER) =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
-        url = f"https://www.amazon.in/s?k={query_encoded}"
-        resp = await client.get(url, headers=AMAZON_HEADERS)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            items = soup.select('div[data-component-type="s-search-result"]')
-            for item in items:
-                title_tag = item.select_one("h2 a span")
-                link_tag = item.select_one("h2 a")
-                price_whole = item.select_one(".a-price-whole")
-
-                if title_tag and link_tag:
-                    href = link_tag.get("href", "")
-                    asin_match = re.search(r"/dp/([A-Z0-9]{10})", href)
-                    if asin_match and price_whole:
-                        asin = asin_match.group(1)
-                        return {
-                            "available": True,
-                            "title": title_tag.text.strip(),
-                            "price": f"₹{price_whole.text.strip().replace(',', '')}",
-                            "pdp_url": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
-                        }
-    except Exception:
-        pass
-
-    try:
-        bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
+        bing_url = f"https://www.bing.com/search?q=amazon+in+dp+{query_encoded}"
         resp = await client.get(bing_url, headers=SEARCH_HEADERS)
         if resp.status_code == 200:
             html = resp.text
-            links = re.findall(r'href="(https://www\.amazon\.in/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)
-            if not links:
-                links = re.findall(r"""(https://www\.amazon\.in/[^\s"'<>]+?/dp/([A-Z0-9]{10}))""", html)
-            if links:
-                full_match, asin = links[0] if isinstance(links[0], tuple) else (links[0], "")
-                price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
+
+            # 1. Base64 decoded u=a1... (Decodes Bing protected links)
+            for m in re.findall(r"u=a1([A-Za-z0-9_-]+)", html):
+                try:
+                    padded = m + "=" * (-len(m) % 4)
+                    decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                    asin_match = re.search(r"/dp/([A-Z0-9]{10})", decoded)
+                    if asin_match:
+                        asin = asin_match.group(1)
+                        clean_pdp = f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
+                        p_match = re.search(r"(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)", html)
+                        price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
+                        return {
+                            "available": True,
+                            "title": clean_q,
+                            "price": price_str,
+                            "pdp_url": clean_pdp
+                        }
+                except Exception:
+                    pass
+
+            # 2. Direct ASIN in cite or plain text
+            asins = re.findall(r"/dp/([A-Z0-9]{10})", html)
+            if asins:
+                asin = asins[0]
+                clean_pdp = f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
+                p_match = re.search(r"(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)", html)
+                price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
                 return {
                     "available": True,
                     "title": clean_q,
                     "price": price_str,
-                    "pdp_url": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
+                    "pdp_url": clean_pdp
                 }
     except Exception:
         pass
@@ -121,7 +109,7 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART SCRAPER (PROVEN WORKING) =================
+# ================= 2. FLIPKART SCRAPER (PROVEN WORKING IN 80922) =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
