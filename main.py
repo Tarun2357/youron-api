@@ -15,15 +15,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SEARCH_HEADERS = {
+AMAZON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "DNT": "1",
+}
+
+FLIPKART_CRAWLER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
 }
 
-# Flipkart Search Engine Crawler Headers (Verified 100% Working in 80918)
-FLIPKART_CRAWLER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+SEARCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-IN,en;q=0.9",
 }
@@ -33,8 +39,11 @@ def home():
     return {"status": "ok", "service": "Youron API Running"}
 
 def clean_query_text(q: str) -> str:
+    # Remove accidental markdown URL / brackets
+    q = re.sub(r'\]\s*\(https?://[^\)]+\)', '', q)
+    q = re.sub(r'https?://\S+', '', q)
     q = re.sub(r'(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)', '', q)
-    q = q.split('|')[0].split('(')[0].split('[')[0].strip()
+    q = q.split('|')[0].split('(')[0].split('[')[0].split(']')[0].strip()
     q = re.sub(r'[!?,]', '', q)
     q = re.sub(r'(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b', '', q)
     words = q.split()
@@ -58,56 +67,53 @@ async def compare_prices(query: str = Query(..., min_length=2)):
         "flipkart": flipkart_data
     }
 
-# ================= 1. AMAZON (PROVEN 80904 BING ENGINE) =================
+# ================= 1. AMAZON SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Bing site:amazon.in/dp/ (Proven to return ₹399 in 80904)
-    try:
-        bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
-        resp = await client.get(bing_url, headers=SEARCH_HEADERS)
-        if resp.status_code == 200:
-            html = resp.text
-            
-            # Find direct ASIN link
-            links = re.findall(r'href="(https://www\.amazon\.in/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)
-            if not links:
-                links = re.findall(r'(https://www\.amazon\.in/[^"\'\s<>]+?/dp/([A-Z0-9]{10}))', html)
-
-            if links:
-                full_match, asin = links[0]
-                clean_pdp = f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
-                price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
-
-                return {
-                    "available": True,
-                    "title": clean_q,
-                    "price": price_str,
-                    "pdp_url": clean_pdp
-                }
-    except Exception:
-        pass
-
-    # Method B: Direct Amazon Search fallback
+    # Method A: Direct Amazon Scraping (Desktop Headers)
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
-        resp = await client.get(url, headers=FLIPKART_CRAWLER_HEADERS)
+        resp = await client.get(url, headers=AMAZON_HEADERS)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             items = soup.select('div[data-component-type="s-search-result"]')
             for item in items:
+                title_tag = item.select_one("h2 a span")
                 link_tag = item.select_one("h2 a")
                 price_whole = item.select_one(".a-price-whole")
-                if link_tag:
+
+                if title_tag and link_tag:
                     href = link_tag.get("href", "")
                     asin_match = re.search(r"/dp/([A-Z0-9]{10})", href)
                     if asin_match and price_whole:
                         asin = asin_match.group(1)
                         return {
                             "available": True,
-                            "title": clean_q,
+                            "title": title_tag.text.strip(),
                             "price": f"₹{price_whole.text.strip().replace(',', '')}",
                             "pdp_url": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
                         }
+    except Exception:
+        pass
+
+    # Method B: Bing Index Fallback
+    try:
+        bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
+        resp = await client.get(bing_url, headers=SEARCH_HEADERS)
+        if resp.status_code == 200:
+            html = resp.text
+            links = re.findall(r'href="(https://www\.amazon\.in/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)
+            if not links:
+                links = re.findall(r'(https://www\.amazon\.in/[^"\'\s<>]+?/dp/([A-Z0-9]{10}))', html)
+            if links:
+                full_match, asin = links[0]
+                price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
+                return {
+                    "available": True,
+                    "title": clean_q,
+                    "price": price_str,
+                    "pdp_url": f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
+                }
     except Exception:
         pass
 
@@ -118,7 +124,7 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART (VERIFIED WORKING ENGINE) =================
+# ================= 2. FLIPKART SCRAPER (PROVEN WORKING) =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
