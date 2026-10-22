@@ -50,21 +50,23 @@ async def compare_prices(query: str = Query(..., min_length=2)):
         "flipkart": flipkart_data
     }
 
-# ================= 1. AMAZON (PROVEN WORKING BING INDEX) =================
+# ================= 1. AMAZON (EXACT 80904 PROVEN CODE) =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
         resp = await client.get(bing_url)
         if resp.status_code == 200:
             html = resp.text
-            
-            # Match 10-digit Amazon ASIN
-            asins = re.findall(r'/dp/([A-Z0-9]{10})', html)
-            if asins:
-                asin = asins[0]
+            links = re.findall(r'href="(https://www\.amazon\.in/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)
+            if not links:
+                links = re.findall(r'(https://www\.amazon\.in/[^"\'\s<>]+?/dp/([A-Z0-9]{10}))', html)
+
+            if links:
+                full_match, asin = links[0]
                 clean_pdp = f"https://www.amazon.in/dp/{asin}?tag=youronapp21-21"
-                p_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
+                price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
+
                 return {
                     "available": True,
                     "title": clean_q,
@@ -81,17 +83,17 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART (BING + DUCKDUCKGO DECODER) =================
+# ================= 2. FLIPKART (MULTI-INDEX WITH FIXED REGEX) =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Bing Search
+    # Method A: Bing Search with clean base64 extractor
     try:
-        bing_url = f"https://www.bing.com/search?q=flipkart+{query_encoded}"
+        bing_url = f"https://www.bing.com/search?q=site%3Aflipkart.com+{query_encoded}"
         resp = await client.get(bing_url)
         if resp.status_code == 200:
             html = resp.text
 
-            # 1. Decode Bing Base64 redirect links: u=a1...
-            b64_matches = re.findall(r'[?&]u=a1([A-Za-z0-9_-]+)', html)
+            # 1. Decode all Bing redirect links (handles &amp;u=a1 and &u=a1)
+            b64_matches = re.findall(r'u=a1([A-Za-z0-9_-]+)', html)
             for m in b64_matches:
                 try:
                     padded = m + '=' * (-len(m) % 4)
@@ -99,8 +101,8 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
                     if "flipkart.com" in decoded and ("/p/" in decoded or "itm" in decoded):
                         clean_url = decoded.split("?")[0]
                         pdp_url = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
-                        p_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                        price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
+                        price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                        price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
                         return {
                             "available": True,
                             "title": clean_q,
@@ -110,26 +112,25 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
                 except Exception:
                     pass
 
-            # 2. Match plain Flipkart links
-            urls = re.findall(r'(https://[a-zA-Z0-9.-]*flipkart\.com/[^\s"\'<>]+)', html)
-            for u in urls:
-                if "/p/" in u or "itm" in u:
-                    clean_url = u.split("?")[0]
-                    pdp_url = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
-                    p_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                    price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
-                    return {
-                        "available": True,
-                        "title": clean_q,
-                        "price": price_str,
-                        "pdp_url": pdp_url
-                    }
+            # 2. Check plain flipkart product links in html
+            direct_matches = re.findall(r'(https://[a-zA-Z0-9.-]*flipkart\.com/[^"\'\s<>&]+/p/[^"\'\s<>&]+)', html)
+            if direct_matches:
+                clean_url = direct_matches[0].split("?")[0]
+                pdp_url = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
+                price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
+                return {
+                    "available": True,
+                    "title": clean_q,
+                    "price": price_str,
+                    "pdp_url": pdp_url
+                }
     except Exception:
         pass
 
-    # Method B: DuckDuckGo Lite Fallback
+    # Method B: DuckDuckGo Lite Search
     try:
-        ddg_url = f"https://lite.duckduckgo.com/lite/?q=flipkart+{query_encoded}"
+        ddg_url = f"https://lite.duckduckgo.com/lite/?q=site%3Aflipkart.com+{query_encoded}"
         resp = await client.get(ddg_url)
         if resp.status_code == 200:
             html = resp.text
@@ -139,8 +140,31 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
                 if "flipkart.com" in decoded and ("/p/" in decoded or "itm" in decoded):
                     clean_url = decoded.split("&")[0].split("?")[0]
                     pdp_url = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
-                    p_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
-                    price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
+                    price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                    price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
+                    return {
+                        "available": True,
+                        "title": clean_q,
+                        "price": price_str,
+                        "pdp_url": pdp_url
+                    }
+    except Exception:
+        pass
+
+    # Method C: Yahoo Search Engine
+    try:
+        yahoo_url = f"https://search.yahoo.com/search?p=flipkart+{query_encoded}"
+        resp = await client.get(yahoo_url)
+        if resp.status_code == 200:
+            html = resp.text
+            ru_matches = re.findall(r'RU=(https%3a%2f%2fwww\.flipkart\.com%2f[^/&"]+)', html, re.IGNORECASE)
+            for ru in ru_matches:
+                decoded = urllib.parse.unquote(ru)
+                if "/p/" in decoded or "itm" in decoded:
+                    clean_url = decoded.split("?")[0]
+                    pdp_url = clean_url.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
+                    price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
+                    price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
                     return {
                         "available": True,
                         "title": clean_q,
