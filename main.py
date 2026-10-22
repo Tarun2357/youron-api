@@ -24,21 +24,27 @@ HEADERS = {
 def home():
     return {"status": "ok", "service": "Youron API Running"}
 
-def clean_query(q: str) -> str:
+def clean_query_text(q: str) -> str:
+    # Brand prefix hatayein
     q = re.sub(r'(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)', '', q)
-    q = q.split('|')[0].split('(')[0].split('[')[0].strip()
+    # Delimiters par cut karein
+    q = re.split(r'[|\[(]', q)[0].strip()
     q = re.sub(r'[!?,]', '', q)
     q = re.sub(r'(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b', '', q)
+    # Pehle 4-5 words rakhein taaki search accurate ho
+    words = q.split()
+    if len(words) > 5:
+        q = " ".join(words[:5])
     return re.sub(r'\s+', ' ', q).strip()
 
 @app.get("/compare")
 async def compare_prices(query: str = Query(..., min_length=2)):
-    q_clean = clean_query(query)
+    q_clean = clean_query_text(query)
     q_encoded = urllib.parse.quote_plus(q_clean)
 
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=12.0, follow_redirects=True) as client:
         amazon_data = await scrape_amazon(client, q_encoded)
-        flipkart_data = await scrape_flipkart(client, q_clean, q_encoded)
+        flipkart_data = await scrape_flipkart(client, q_clean)
 
     return {
         "query": query,
@@ -50,7 +56,7 @@ async def compare_prices(query: str = Query(..., min_length=2)):
 async def scrape_amazon(client: httpx.AsyncClient, query_encoded: str):
     url = f"https://www.amazon.in/s?k={query_encoded}"
     try:
-        resp = await client.get(url, headers=HEADERS)
+        resp = await client.get(url)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             items = soup.select('div[data-component-type="s-search-result"]')
@@ -79,60 +85,66 @@ async def scrape_amazon(client: httpx.AsyncClient, query_encoded: str):
         pass
     return {"available": False, "price": "", "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"}
 
-async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method 1: Google Web Cache Gateway (Never Blocked by Flipkart Firewall)
+async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str):
+    # Method 1: DuckDuckGo Lite Index (Never Blocks Cloud IPs & Returns Real Flipkart PDP)
     try:
-        gw_url = f"https://html.duckduckgo.com/html/?q={query_encoded}+site:flipkart.com/p/"
-        resp = await client.get(gw_url, headers=HEADERS)
+        ddg_search = urllib.parse.quote_plus(f"{clean_q} site:flipkart.com/p/")
+        ddg_url = f"https://lite.duckduckgo.com/lite/?q={ddg_search}"
+        
+        resp = await client.get(ddg_url)
         if resp.status_code == 200:
-            text = resp.text
-            # Extract real decoded Flipkart PDP url
-            matches = re.findall(r'uddg=(https[^&"]+)', text)
+            html = resp.text
+            # Extract redirected links
+            matches = re.findall(r'uddg=(https[^&"]+)', html)
             for m in matches:
                 decoded = urllib.parse.unquote(m)
                 if "flipkart.com" in decoded and ("/p/" in decoded or "itm" in decoded):
                     clean_pdp = decoded.split("?")[0]
-                    # Format as direct deep link
+                    # Direct Deep-Link Scheme
                     full_pdp = clean_pdp.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
 
-                    # Extract price from snippet
-                    p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', text)
-                    price_str = f"₹{p_match.group(1).replace(',', '')}" if p_match else "Best Price"
+                    # Search price in html snippet
+                    p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', html)
+                    price_val = f"₹{p_match.group(1).replace(',', '')}" if p_match else ""
 
                     return {
                         "available": True,
                         "title": clean_q,
-                        "price": price_str,
+                        "price": price_val if price_val else "Best Deal",
                         "pdp_url": full_pdp
                     }
     except Exception:
         pass
 
-    # Method 2: Public JSON Discover Suggestion
+    # Method 2: Yahoo Web Search Index Fallback
     try:
-        rome_url = f"https://1.rome.api.flipkart.com/api/4/discover/autosuggest?prefix={query_encoded}&vertical=all"
-        resp = await client.get(rome_url, headers=HEADERS)
+        y_search = urllib.parse.quote_plus(f"{clean_q} site:flipkart.com/p/")
+        y_url = f"https://search.yahoo.com/search?p={y_search}"
+        resp = await client.get(y_url)
         if resp.status_code == 200:
-            data = resp.json()
-            suggestions = data.get("RESPONSE", {}).get("suggestions", [])
-            for s in suggestions:
-                u = s.get("url", "")
-                if "/p/" in u or "itm" in u:
-                    clean_u = u.split("?")[0]
-                    full_pdp = f"https://dl.flipkart.com/dl{clean_u}" if clean_u.startswith("/") else f"https://dl.flipkart.com/dl/{clean_u}"
+            text = resp.text
+            matches = re.findall(r'RU=([^/&"]+)', text)
+            for m in matches:
+                decoded = urllib.parse.unquote(m)
+                if "flipkart.com" in decoded and ("/p/" in decoded or "itm" in decoded):
+                    clean_pdp = decoded.split("?")[0]
+                    full_pdp = clean_pdp.replace("https://www.flipkart.com/", "https://dl.flipkart.com/dl/")
+                    p_match = re.search(r'(?:₹|Rs\.?|&#8377;|INR)\s*([0-9,]+)', text)
+                    price_val = f"₹{p_match.group(1).replace(',', '')}" if p_match else ""
                     return {
                         "available": True,
-                        "title": s.get("title", clean_q),
-                        "price": "Check on Flipkart",
+                        "title": clean_q,
+                        "price": price_val if price_val else "Best Deal",
                         "pdp_url": full_pdp
                     }
     except Exception:
         pass
 
-    # Fallback to direct app product search
+    # Fallback to direct app search intent
+    q_enc = urllib.parse.quote_plus(clean_q)
     return {
         "available": True,
         "title": clean_q,
         "price": "Check on Flipkart",
-        "pdp_url": f"https://dl.flipkart.com/dl/search?q={query_encoded}"
+        "pdp_url": f"https://dl.flipkart.com/dl/search?q={q_enc}"
     }
