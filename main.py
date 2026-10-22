@@ -39,17 +39,16 @@ def home():
     return {"status": "ok", "service": "Youron API Running"}
 
 def clean_query_text(q: str) -> str:
-    # Remove accidental markdown URL / brackets
-    q = re.sub(r'\]\s*\(https?://[^\)]+\)', '', q)
-    q = re.sub(r'https?://\S+', '', q)
-    q = re.sub(r'(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)', '', q)
-    q = q.split('|')[0].split('(')[0].split('[')[0].split(']')[0].strip()
-    q = re.sub(r'[!?,]', '', q)
-    q = re.sub(r'(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b', '', q)
+    q = re.sub(r"\]\s*\(https?://[^\)]+\)", "", q)
+    q = re.sub(r"https?://\S+", "", q)
+    q = re.sub(r"(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)", "", q)
+    q = q.split("|")[0].split("(")[0].split("[")[0].split("]")[0].strip()
+    q = re.sub(r"[!?,]", "", q)
+    q = re.sub(r"(?i)\b(deal of the day|with led light|non-sticky|glowing skin|enriched with)\b", "", q)
     words = q.split()
     if len(words) > 5:
         q = " ".join(words[:5])
-    return re.sub(r'\s+', ' ', q).strip()
+    return re.sub(r"\s+", " ", q).strip()
 
 @app.get("/compare")
 async def compare_prices(query: str = Query(..., min_length=2)):
@@ -69,7 +68,6 @@ async def compare_prices(query: str = Query(..., min_length=2)):
 
 # ================= 1. AMAZON SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Direct Amazon Scraping (Desktop Headers)
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
         resp = await client.get(url, headers=AMAZON_HEADERS)
@@ -95,7 +93,6 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
     except Exception:
         pass
 
-    # Method B: Bing Index Fallback
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
         resp = await client.get(bing_url, headers=SEARCH_HEADERS)
@@ -103,9 +100,9 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
             html = resp.text
             links = re.findall(r'href="(https://www\.amazon\.in/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)
             if not links:
-                links = re.findall(r'(https://www\.amazon\.in/[^"\'\s<>]+?/dp/([A-Z0-9]{10}))', html)
+                links = re.findall(r"""(https://www\.amazon\.in/[^\s"'<>]+?/dp/([A-Z0-9]{10}))""", html)
             if links:
-                full_match, asin = links[0]
+                full_match, asin = links[0] if isinstance(links[0], tuple) else (links[0], "")
                 price_match = re.search(r'(?:₹|Rs\.?|INR|&#8377;)\s*([0-9,]+)', html)
                 price_str = f"₹{price_match.group(1).replace(',', '')}" if price_match else "Best Price"
                 return {
