@@ -36,15 +36,14 @@ def home():
     return {"status": "ok", "service": "Youron Ultra-Fast Price Engine"}
 
 def clean_query_text(q: str) -> str:
-    # 1. Remove markdown links / brackets
     q = re.sub(r"\]\s*\(https?://[^\)]+\)", "", q)
     q = re.sub(r"https?://\S+", "", q)
-    # 2. Remove specifications that break search (RAM, GB, Colors, Delimiters)
     q = re.sub(r"\(.*?\)", "", q)
     q = re.sub(r"\[.*?\]", "", q)
     q = re.sub(r"(?i)\b\d+\s*(?:gb|ram|rom|tb|storage|inch|cm|display)\b", "", q)
     q = re.sub(r"(?i)\b(black|blue|white|green|grey|red|silver|gold)\b", "", q)
-    q = re.sub(r"[-–|,].*", "", q)
+    # Only split if hyphen is surrounded by spaces (preserving Thar-04 model numbers)
+    q = re.sub(r"\s+[-–|]\s+.*", "", q)
     q = re.sub(r"(?i)^(Amazon Brand\s*-\s*|Flipkart SmartBuy\s*-\s*)", "", q)
     q = re.sub(r"[!?,]", "", q)
     words = q.split()
@@ -64,7 +63,6 @@ async def compare_prices(query: str = Query(..., min_length=2)):
 
     q_encoded = urllib.parse.quote_plus(q_clean)
 
-    # Parallel Fetching (Under 3 seconds)
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         amz_task = scrape_amazon(client, q_clean, q_encoded)
         fk_task = scrape_flipkart(client, q_clean, q_encoded)
@@ -80,9 +78,7 @@ async def compare_prices(query: str = Query(..., min_length=2)):
     PRICE_CACHE[cache_key] = (response_payload, time.time())
     return response_payload
 
-# ================= 1. AMAZON SCRAPER =================
 async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
-    # Method A: Direct Amazon Scraping
     try:
         url = f"https://www.amazon.in/s?k={query_encoded}"
         resp = await client.get(url, headers=DESKTOP_HEADERS)
@@ -103,7 +99,6 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
     except Exception:
         pass
 
-    # Method B: Bing Fallback
     try:
         bing_url = f"https://www.bing.com/search?q=site%3Aamazon.in%2Fdp%2F+{query_encoded}"
         resp = await client.get(bing_url, headers=DESKTOP_HEADERS)
@@ -130,7 +125,6 @@ async def scrape_amazon(client: httpx.AsyncClient, clean_q: str, query_encoded: 
         "pdp_url": f"https://www.amazon.in/s?k={query_encoded}&tag=youronapp21-21"
     }
 
-# ================= 2. FLIPKART SCRAPER =================
 async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded: str):
     try:
         fk_url = f"https://www.flipkart.com/search?q={query_encoded}"
@@ -170,7 +164,6 @@ async def scrape_flipkart(client: httpx.AsyncClient, clean_q: str, query_encoded
         "pdp_url": f"https://www.flipkart.com/search?q={query_encoded}"
     }
 
-# ================= 3. BALANCED HOME DEALS FEED =================
 @app.get("/home-deals")
 async def get_home_deals(page: int = 1):
     categories = ["smartphones", "laptops", "headphones", "smart watches", "shoes"]
@@ -193,9 +186,7 @@ async def get_home_deals(page: int = 1):
                         img_el = a.select_one("img")
                         if title_el and price_el:
                             digits = re.search(r'([0-9,]+)', price_el.text)
-                            img_src = img_el.get("src", "") if img_el else ""
-                            if not img_src or "data:image" in img_src:
-                                img_src = "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=400&q=80"
+                            img_src = img_el.get("src", "") if img_el else "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?w=400&q=80"
                             fk_deals.append({
                                 "title": title_el.text.strip(),
                                 "price": f"₹{digits.group(1).replace(',', '')}" if digits else "₹499",
